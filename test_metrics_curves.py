@@ -1,5 +1,3 @@
-
-
 import os
 import random
 import numpy as np
@@ -13,12 +11,11 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 import torch
-
+import torch.nn.functional as F
 
 from model import TemporalStabilityPredictor
 
 warnings.filterwarnings("ignore")
-
 
 plt.rcParams.update({
     "font.family": "serif",
@@ -32,12 +29,9 @@ plt.rcParams.update({
     "grid.linestyle": "--"
 })
 
-
-DATASET_DIR = "./processed_patchs_select"
-
+DATASET_DIR = "/media/yy/F882CFDC82CF9D8E/frame_data/D2/processed_patchs_select"
 
 CKPT_PATH = "./checkpoints_SS13V2_T6/epoch68-val_loss3.2424.ckpt"
-# CKPT_PATH = "./checkpoints_SS06_T6/epoch67-val_loss1.7068.ckpt"
 
 NUM_TEST_SAMPLES = 500
 CROP_SIZE = 224
@@ -95,12 +89,12 @@ def _sample_files(files, seq_len):
 
 
 def run_evaluation():
-    print("正在加载 Deep Learning 模型 (全流水线追踪模式)...")
+    print("Loading Deep Learning model (full pipeline tracking mode)...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = TemporalStabilityPredictor.load_from_checkpoint(CKPT_PATH, config=config).eval().to(device)
-    print(f"模型加载成功！来源: {CKPT_PATH}")
+    print(f"Model loaded successfully! Source: {CKPT_PATH}")
 
-    print(f"\n正在扫描数据集: {DATASET_DIR} ...")
+    print(f"\nScanning dataset: {DATASET_DIR} ...")
     valid_grids = []
     for root, dirs, files in os.walk(DATASET_DIR):
         opt_files = [os.path.join(root, f) for f in files if f.startswith('OPT_') and f.endswith(('.tif', '.tiff'))]
@@ -110,7 +104,7 @@ def run_evaluation():
             valid_grids.append({"opt": sorted(opt_files), "sar": sorted(sar_files), "id": os.path.basename(root)})
 
     if not valid_grids:
-        raise ValueError(f"未找到有效切片数据！(请确保数据集每个文件夹至少包含 {TRAIN_SEQ_LEN} 个 OPT 和 SAR)")
+        raise ValueError(f"No valid patch data found! (Please ensure each folder in the dataset contains at least {TRAIN_SEQ_LEN} OPT and SAR)")
 
     valid_grids.sort(key=lambda x: x['id'])
     random.seed(42)
@@ -120,19 +114,24 @@ def run_evaluation():
 
     random.seed(999)
     test_grids = random.sample(unseen_grids, min(NUM_TEST_SAMPLES, len(unseen_grids)))
-    print(f"选定 {len(test_grids)} 对样本进行评测 (Full Tracking Pipeline)...\n")
+    print(f"Selected {len(test_grids)} pairs of samples for evaluation (Full Tracking Pipeline)...\n")
 
     results_db = []
-
+    model_exported_points = []
     with torch.no_grad():
         for i, grid_info in enumerate(tqdm(test_grids, desc="Run: Full Tracking Pipeline")):
             full_opt = grid_info["opt"]
             full_sar = grid_info["sar"]
 
-            opt1_seq = torch.stack([_read_tif_tensor(f) for f in _sample_files(full_opt, TRAIN_SEQ_LEN)], dim=0)
-            opt2_seq = torch.stack([_read_tif_tensor(f) for f in _sample_files(full_opt, TRAIN_SEQ_LEN)], dim=0)
-            sar1_seq = torch.stack([_read_tif_tensor(f) for f in _sample_files(full_sar, TRAIN_SEQ_LEN)], dim=0)
-            sar2_seq = torch.stack([_read_tif_tensor(f) for f in _sample_files(full_sar, TRAIN_SEQ_LEN)], dim=0)
+            opt1_fs = _sample_files(full_opt, TRAIN_SEQ_LEN)
+            opt2_fs = _sample_files(full_opt, TRAIN_SEQ_LEN)
+            sar1_fs = _sample_files(full_sar, TRAIN_SEQ_LEN)
+            sar2_fs = _sample_files(full_sar, TRAIN_SEQ_LEN)
+
+            opt1_seq = torch.stack([_read_tif_tensor(f) for f in opt1_fs], dim=0)
+            opt2_seq = torch.stack([_read_tif_tensor(f) for f in opt2_fs], dim=0)
+            sar1_seq = torch.stack([_read_tif_tensor(f) for f in sar1_fs], dim=0)
+            sar2_seq = torch.stack([_read_tif_tensor(f) for f in sar2_fs], dim=0)
 
             if any(t is None for t in [opt1_seq, opt2_seq, sar1_seq, sar2_seq]): continue
 
@@ -142,7 +141,6 @@ def run_evaluation():
 
             opt_top, opt_left = max_safe_y, max_safe_x
             bound_y, bound_x = min(MAX_SHIFT, max_safe_y), min(MAX_SHIFT, max_safe_x)
-
 
             dx1, dy1 = random.randint(-bound_x, bound_x), random.randint(-bound_y, bound_y)
             dx2, dy2 = random.randint(-bound_x, bound_x), random.randint(-bound_y, bound_y)
@@ -182,6 +180,25 @@ def run_evaluation():
                 diff_label = "Small (0-5px)" if init_shift_mag <= 5 else (
                     "Medium (6-10px)" if init_shift_mag <= 10 else "Large (>10px)")
 
+                if 'model_exported_points' not in locals(): model_exported_points = []
+                if len(model_exported_points) < 4:
+                    abs_opt_x = opt_left + res1['opt_x'].item()
+                    abs_opt_y = opt_top + res1['opt_y'].item()
+
+                    model_exported_points.append({
+                        'grid_id': grid_info['id'],
+                        'anchor_x': float(abs_opt_x),
+                        'anchor_y': float(abs_opt_y),
+                        'opt1_file': opt1_fs[int(res1['best_t'].item())],
+                        'opt2_file': opt2_fs[int(res3['best_t'].item())],
+                        'sar1_file': sar1_fs[0],
+                        'sar2_file': sar2_fs[0],
+                        'metrics': {
+                            'abs_epe': float(abs1),
+                            'sar_cycle': float(sar_cycle),
+                            'opt_cycle': float(opt_cycle)
+                        }
+                    })
                 results_db.append({
                     'abs': abs1,
                     'cycle': sar_cycle,
@@ -193,13 +210,17 @@ def run_evaluation():
 
             except Exception as e:
                 import traceback
-                print(f"在样本 {i} 发生错误:")
+                print(f"Error occurred in sample {i}:")
                 traceback.print_exc()
 
+    import json
+    with open("model_exported_points.json", "w", encoding='utf-8') as f:
+        json.dump(model_exported_points, f, indent=4)
+    print("Successfully exported the model anchor points of the first 4 samples to model_exported_points.json!")
     total = len(results_db)
     if total == 0: return
 
-    print(f"\n正在生成图表至 {VIZ_OUTPUT_DIR}/metrics_curves ...")
+    print(f"\nGenerating charts to {VIZ_OUTPUT_DIR}/metrics_curves ...")
     df = pd.DataFrame(results_db)
 
     df_valid = df[df['abs'] < MAX_PENALTY_EPE]
@@ -263,8 +284,7 @@ def run_evaluation():
     fig.savefig(combined_path)
     plt.close(fig)
 
-    print(f"成功生成 2x2 拼接分析大图，已保存至: {combined_path}\n")
-    # =========================================================================
+    print(f"Successfully generated 2x2 combined analysis chart, saved to: {combined_path}\n")
 
     mean_abs = df['abs'].mean()
     mean_sar_cyc = df['cycle'].mean()
@@ -281,4 +301,3 @@ def run_evaluation():
 
 if __name__ == "__main__":
     run_evaluation()
-
